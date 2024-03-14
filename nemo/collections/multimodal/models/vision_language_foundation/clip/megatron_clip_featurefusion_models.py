@@ -1,5 +1,6 @@
 import sys
 
+import einops
 import clip
 import torch
 import torch.distributed.nn
@@ -112,7 +113,7 @@ class MegatronCLIPFeatureFusionModel(MegatronCLIPModel):
                     parallel_state.set_virtual_pipeline_model_parallel_rank(i)
                 parallel_state.set_virtual_pipeline_model_parallel_rank(0)
         
-        #ToDo: check the configuration of T5 model
+        #ToDo: check the configuration of T5 model and if we need to pull T5 from Nemo model
         conf_t5 = T5Config()
         conf_t5.num_layers = 2
         conf_t5.num_decoder_layers = 2
@@ -122,6 +123,11 @@ class MegatronCLIPFeatureFusionModel(MegatronCLIPModel):
         self.t5_layers = T5Stack(conf_t5)
 
     def encode_text(self, text_tensor):
+        """ 
+        text_tensor [bs, seq_len]
+        output_tensor [bs, seq_len, hidden_size]
+        """
+        output_tensor = self.model.text_encoder(text_tensor)
         x = self.model.text_encoder.language_model.embedding.word_embeddings(text_tensor) # [batch_size, n_ctx, d_model]
         x = x + self.model.text_encoder.language_model.embedding.position_embeddings.weight
         x = x.permute(1, 0, 2)  # NLD -> LND
@@ -129,12 +135,15 @@ class MegatronCLIPFeatureFusionModel(MegatronCLIPModel):
         attn_mask = self.model.text_encoder.build_attention_mask(self.cfg.text.max_position_embeddings)
         x = self.model.text_encoder.language_model.encoder(x, attn_mask)
         x = x.permute(1, 0, 2)  # LND -> NLD
-        x = self.model.text_encoder.head(x)
+        output_tensor = self.model.text_encoder.head(x)
         
-        return x
+        return output_tensor
 
     def encode_image(self, image_tensor):
-        import einops
+        """ 
+        text_tensor [bs, channel, image_h, image_w]
+        output_tensor [bs, seq_len + class_token_len, hidden_size]
+        """
         if self.cfg.vision.pre_process:
             rearranged_input = einops.rearrange(
                 image_tensor, "b c (h p1) (w p2) -> b (h w) (p1 p2 c)", p1=self.cfg.vision.patch_dim, p2=self.cfg.vision.patch_dim,
@@ -171,9 +180,8 @@ class MegatronCLIPFeatureFusionModel(MegatronCLIPModel):
         if self.cfg.vision.post_process:
             # [s b h] => [b s h]
             hidden_states = hidden_states.transpose(0, 1).contiguous()
-        hidden_states = self.model.vision_encoder.head(hidden_states)
-
-        return hidden_states
+        output_tensor = self.model.vision_encoder.head(hidden_states)
+        return output_tensor
 
     def forward(self, batch):
 
