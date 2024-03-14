@@ -122,33 +122,70 @@ class MegatronCLIPFeatureFusionModel(MegatronCLIPModel):
         self.t5_layers = T5Stack(conf_t5)
 
     def encode_text(self, text_tensor):
-        import pdb; pdb.set_trace()
-        attention_mask = ~(text_tensor == 0)
         x = self.model.text_encoder.language_model.embedding.word_embeddings(text_tensor) # [batch_size, n_ctx, d_model]
-
         x = x + self.model.text_encoder.language_model.embedding.position_embeddings.weight
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.model.text_encoder.language_model.encoder(x, attention_mask)
+        #TOdo: Check if the attn_mask is incorporated correctly here. 
+        attn_mask = self.model.text_encoder.build_attention_mask(self.cfg.text.max_position_embeddings)
+        x = self.model.text_encoder.language_model.encoder(x, attn_mask)
         x = x.permute(1, 0, 2)  # LND -> NLD
-        x = self.model.head(x)
-        import pdb; pdb.set_trace()
+        x = self.model.text_encoder.head(x)
+        
         return x
+
+    def encode_image(self, image_tensor):
+        import einops
+        if self.cfg.vision.pre_process:
+            rearranged_input = einops.rearrange(
+                image_tensor, "b c (h p1) (w p2) -> b (h w) (p1 p2 c)", p1=self.cfg.vision.patch_dim, p2=self.cfg.vision.patch_dim,
+            )
+            # [b num_patch patch_dim*patch_dim*c] ->  [b, s, h]; s:=num_patch, h:=hidden
+            encoder_output = self.model.vision_encoder.backbone.linear_encoder(rearranged_input)
+            concatenated_tokens = encoder_output
+            if self.cfg.vision.class_token_length:
+                cls_tokens = self.model.vision_encoder.backbone.cls_token.expand(encoder_output.shape[0], -1, -1)
+                concatenated_tokens = torch.cat((cls_tokens, encoder_output), dim=1)
+
+            if self.cfg.vision.position_embedding_type == "learned_absolute":
+                token_embeddings = concatenated_tokens + self.model.vision_encoder.backbone.position_embeddings(
+                    torch.arange(concatenated_tokens.shape[1]).expand(1, -1).cuda()[:, : concatenated_tokens.shape[1]]
+                )
+            elif self.cfg.vision.position_embedding_type == "learned_parameters":
+                token_embeddings = concatenated_tokens + self.model.vision_encoder.backbone.interpolate_pos_encoding(concatenated_tokens)
+            else:
+                raise ValueError(f"Unrecognized position embedding type: {self.cfg.vision.position_embedding_type}.")
+
+            # a patch_dropout of 0. would mean it is disabled and this function would do nothing but return what was passed in
+            token_embeddings = self.model.vision_encoder.backbone.drop_patch(token_embeddings)
+
+            if self.cfg.vision.preprocess_layernorm is not None:
+                token_embeddings = self.model.vision_encoder.backbone.preprocess_layernorm(token_embeddings)
+
+            # [b s h] => [s b h]
+            token_embeddings = token_embeddings.transpose(0, 1).contiguous()
+            hidden_states = self.model.vision_encoder.backbone.embedding_dropout(token_embeddings)
+        else:
+            hidden_states = image_tensor
+
+        hidden_states = self.model.vision_encoder.backbone.transformer(hidden_states, None)
+        if self.cfg.vision.post_process:
+            # [s b h] => [b s h]
+            hidden_states = hidden_states.transpose(0, 1).contiguous()
+        hidden_states = self.model.vision_encoder.head(hidden_states)
+
+        return hidden_states
 
     def forward(self, batch):
 
         txt_batched = batch["txt_batched"]
-        image_batched = batch["image_batched"]
+        image_batched = batch["image_batched"] #[bs, width, img_h, img_w]
         txt_mask_batched = batch["txt_mask_batched"]
         image_mask_batched = batch["image_mask_batched"]
         index_mapping = batch["index_mapping"]
 
         text_features = self.encode_text(txt_batched)
-        import pdb; pdb.set_trace()
+        image_features = self.encode_image(image_batched)
 
-        image_features, text_features, _ = self.model(image_batched, txt_batched)
-        image_features = image_features.unsqueeze(dim=1)
-        text_features = text_features.unsqueeze(dim=1)
-        #text_features = self.vision_encoder(image_batched)
         combined_features = torch.cat([text_features, image_features], dim=1) # shape: [batch_size, seq_len, embed_dim]
         # Hugging face model directly called
         # image_features = self.model.encode_image(image_batched)
@@ -159,7 +196,6 @@ class MegatronCLIPFeatureFusionModel(MegatronCLIPModel):
             use_cache=False,
             return_dict=True
         )
-        import pdb; pdb.set_trace()
         def mean_pooling(embeddings):
             return torch.mean(embeddings, dim=1)
 

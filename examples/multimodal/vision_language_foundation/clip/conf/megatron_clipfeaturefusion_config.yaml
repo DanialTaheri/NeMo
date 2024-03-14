@@ -205,7 +205,7 @@ model:
 
   tokenizer:
     library: 'huggingface'
-    type: 'openai/clip-vit-base-patch32'
+    type: 'openai/clip-vit-base-patch16'
     model: null
     vocab_file: null
     merge_file: null
