@@ -22,7 +22,7 @@ exp_manager:
   explicit_log_dir: null
   exp_dir: null
   name: megatron_clip
-  create_wandb_logger: False
+  create_wandb_logger: True
   wandb_logger_kwargs:
     entity: smohsenitahe
     project: multimodal-retriever-nemo

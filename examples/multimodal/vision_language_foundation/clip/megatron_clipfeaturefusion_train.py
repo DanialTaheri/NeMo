@@ -16,8 +16,6 @@ import clip
 from omegaconf.omegaconf import OmegaConf
 from torch.utils.data import DataLoader, DistributedSampler
 from nemo.collections.multimodal.data.clip.mbeir_dataset import (
-    MBEIRCandidatePoolCollator,
-    MBEIRCandidatePoolDataset,
     MBEIRMainCollator,
     MBEIRMainDataset,
     Mode,
@@ -26,7 +24,6 @@ from nemo.collections.multimodal.models.vision_language_foundation.clip.megatron
     MegatronCLIPFeatureFusionModel,
 )
 from nemo.collections.multimodal.data.clip.clip_dataset import get_preprocess_fns
-from nemo.collections.multimodal.models.vision_language_foundation.clip.megatron_clip_models import MegatronCLIPModel
 from nemo.collections.nlp.parts.megatron_trainer_builder import MegatronTrainerBuilder
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
@@ -56,7 +53,7 @@ def main(cfg) -> None:
 
     model = MegatronCLIPFeatureFusionModel(cfg.model, trainer)
     model.train()
-    clip_model, img_preprocess_fn = clip.load("ViT-B/32", "cuda", jit=False, download_root=None)
+    #clip_model, img_preprocess_fn = clip.load("ViT-B/32", "cuda", jit=False, download_root=None)
     clip_tokenizer = clip.tokenize
     val_image_transform, text_transform = get_preprocess_fns(model.cfg, clip_tokenizer, is_train=True,)
 
@@ -73,9 +70,6 @@ def main(cfg) -> None:
         hard_neg_num=0,  # TODO
         returns=cfg.data_config.returns,
     )
-
-
-    #import pdb; pdb.set_trace()
     train_collector = MBEIRMainCollator(
         tokenizer=get_tokenizer(clip_tokenizer),
         image_size=tuple(map(int, cfg.data_config.image_size.split(','))),

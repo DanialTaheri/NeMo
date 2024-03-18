@@ -1,27 +1,19 @@
 import sys
+from nemo.collections.multimodal.data.clip.clip_dataset import get_preprocess_fns
+from nemo.collections.multimodal.losses.clip_loss import InbatchContrastiveLoss
+from nemo.collections.multimodal.models.vision_language_foundation.clip.megatron_clip_models import (
+    MegatronCLIPModel,
+)
+from nemo.core.classes.common import PretrainedModelInfo
+from transformers.models.t5.modeling_t5 import T5Stack
+from transformers.models.t5 import T5Config
 
 import einops
-import clip
 import torch
 import torch.distributed.nn
-import torch.nn.functional as F
 from omegaconf.dictconfig import DictConfig
 from pytorch_lightning.accelerators import CPUAccelerator
 from pytorch_lightning.trainer.trainer import Trainer
-from torch import nn
-from tqdm import tqdm
-
-sys.path.insert(0, "/NeMo/nemo")
-
-from nemo.collections.multimodal.data.clip.clip_dataset import get_preprocess_fns
-from nemo.collections.multimodal.losses.clip_loss import ClipLoss, InbatchContrastiveLoss
-from nemo.collections.multimodal.models.vision_language_foundation.clip.megatron_clip_models import (
-    CLIPModel,
-    MegatronCLIPModel,
-)
-from nemo.collections.nlp.parts.utils_funcs import get_last_rank, torch_dtype_from_precision
-from nemo.collections.vision.modules.vit.vit_backbone import VitBackbone
-from nemo.core.classes.common import PretrainedModelInfo
 from nemo.utils import logging
 
 try:
@@ -42,28 +34,9 @@ except (ImportError, ModuleNotFoundError):
 
     HAVE_MEGATRON_CORE = False
 
-import clip
-
-from transformers.models.t5.modeling_t5 import T5Block, T5Stack
-from transformers.models.t5 import T5Config
-
 class MegatronCLIPFeatureFusionModel(MegatronCLIPModel):
     def __init__(self, cfg: DictConfig, trainer: Trainer, pre_process=True, post_process=True):
         super().__init__(cfg, trainer)
-
-    #     #TODO add support for huggingface models instead of
-    #                           conversion to .nemo
-    #     model_name = "ViT-B/32"
-    #     self.model, self.img_preprocess_fn = clip.load(model_name, "cuda", False, download_root=None)
-    #     self.tokenizer = clip.tokenize
-
-    # def get_tokenizer(self):
-    #     def tokenizer_wrapper(txt):
-    #         tokenizer = self.tokenizer
-    #         txt_tensor = tokenizer(txt, context_length=77, truncate=True)
-    #         return txt_tensor
-
-    #     return tokenizer_wrapper
 
     # TODO add dataset support
     def setup(self, stage=None):
@@ -112,8 +85,7 @@ class MegatronCLIPFeatureFusionModel(MegatronCLIPModel):
                 for i, module in enumerate(self.model):
                     parallel_state.set_virtual_pipeline_model_parallel_rank(i)
                 parallel_state.set_virtual_pipeline_model_parallel_rank(0)
-        
-        #ToDo: check the configuration of T5 model and if we need to pull T5 from Nemo model
+        #ToDo: check the configuration of megatron_T5 model and replace this
         conf_t5 = T5Config()
         conf_t5.num_layers = 2
         conf_t5.num_decoder_layers = 2
@@ -128,7 +100,7 @@ class MegatronCLIPFeatureFusionModel(MegatronCLIPModel):
         output_tensor [bs, seq_len, hidden_size]
         """
         output_tensor = self.model.text_encoder(text_tensor)
-        x = self.model.text_encoder.language_model.embedding.word_embeddings(text_tensor) # [batch_size, n_ctx, d_model]
+        x = self.model.text_encoder.language_model.embedding.word_embeddings(text_tensor) # [batch_size, seq_len, d_model]
         x = x + self.model.text_encoder.language_model.embedding.position_embeddings.weight
         x = x.permute(1, 0, 2)  # NLD -> LND
         #TOdo: Check if the attn_mask is incorporated correctly here. 
@@ -136,14 +108,15 @@ class MegatronCLIPFeatureFusionModel(MegatronCLIPModel):
         x = self.model.text_encoder.language_model.encoder(x, attn_mask)
         x = x.permute(1, 0, 2)  # LND -> NLD
         output_tensor = self.model.text_encoder.head(x)
-        
+
         return output_tensor
 
     def encode_image(self, image_tensor):
         """ 
-        text_tensor [bs, channel, image_h, image_w]
+        image_tensor [bs, channel, image_h, image_w]
         output_tensor [bs, seq_len + class_token_len, hidden_size]
         """
+        # Borrowed scripts from NeMo/nemo/collections/vision/modules/vit/vit_backbone.py
         if self.cfg.vision.pre_process:
             rearranged_input = einops.rearrange(
                 image_tensor, "b c (h p1) (w p2) -> b (h w) (p1 p2 c)", p1=self.cfg.vision.patch_dim, p2=self.cfg.vision.patch_dim,
@@ -181,23 +154,17 @@ class MegatronCLIPFeatureFusionModel(MegatronCLIPModel):
             # [s b h] => [b s h]
             hidden_states = hidden_states.transpose(0, 1).contiguous()
         output_tensor = self.model.vision_encoder.head(hidden_states)
+
         return output_tensor
 
     def forward(self, batch):
 
         txt_batched = batch["txt_batched"]
         image_batched = batch["image_batched"] #[bs, width, img_h, img_w]
-        txt_mask_batched = batch["txt_mask_batched"]
-        image_mask_batched = batch["image_mask_batched"]
         index_mapping = batch["index_mapping"]
-
         text_features = self.encode_text(txt_batched)
         image_features = self.encode_image(image_batched)
-
         combined_features = torch.cat([text_features, image_features], dim=1) # shape: [batch_size, seq_len, embed_dim]
-        # Hugging face model directly called
-        # image_features = self.model.encode_image(image_batched)
-        # text_features = self.model.encode_text(txt_batched)
         transformer_output = self.t5_layers(
             inputs_embeds=combined_features,
             attention_mask=None,
@@ -206,14 +173,12 @@ class MegatronCLIPFeatureFusionModel(MegatronCLIPModel):
         )
         def mean_pooling(embeddings):
             return torch.mean(embeddings, dim=1)
-
         # Pool the output of the T5 transformer to get the final features
         embeddings = mean_pooling(transformer_output.last_hidden_state)
-
         query_embeds = embeddings[torch.tensor(index_mapping["query"]).flatten()]
         pos_cand_embeds = embeddings[torch.tensor(index_mapping["pos_cand"]).flatten()]
-
         output_tensor = query_embeds, pos_cand_embeds
+
         return output_tensor
 
     def get_forward_output_and_loss_func(self):
