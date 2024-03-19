@@ -4,17 +4,27 @@ from nemo.collections.multimodal.losses.clip_loss import InbatchContrastiveLoss
 from nemo.collections.multimodal.models.vision_language_foundation.clip.megatron_clip_models import (
     MegatronCLIPModel,
 )
+from torch.utils.data import DataLoader, DistributedSampler
+from nemo.collections.multimodal.data.clip.mbeir_dataset import (
+    MBEIRMainCollator,
+    MBEIRMainDataset,
+    Mode,
+)
 from nemo.core.classes.common import PretrainedModelInfo
 from transformers.models.t5.modeling_t5 import T5Stack
 from transformers.models.t5 import T5Config
 
 import einops
 import torch
+import clip
 import torch.distributed.nn
 from omegaconf.dictconfig import DictConfig
 from pytorch_lightning.accelerators import CPUAccelerator
 from pytorch_lightning.trainer.trainer import Trainer
 from nemo.utils import logging
+
+
+from nemo.collections.nlp.models.language_modeling.megatron_t5_model import MegatronT5Model
 
 try:
     from apex.transformer.enums import AttnMaskType
@@ -37,6 +47,16 @@ except (ImportError, ModuleNotFoundError):
 class MegatronCLIPFeatureFusionModel(MegatronCLIPModel):
     def __init__(self, cfg: DictConfig, trainer: Trainer, pre_process=True, post_process=True):
         super().__init__(cfg, trainer)
+
+        self.tokenizer = clip.tokenize
+        #self.t5_layers = MegatronT5Model(self.cfg.t5, trainer)
+
+    def get_tokenizer(self):
+        def tokenizer_wrapper(txt):
+            tokenizer = self.tokenizer
+            txt_tensor = tokenizer(txt, context_length=77, truncate=True)
+            return txt_tensor
+        return tokenizer_wrapper
 
     # TODO add dataset support
     def setup(self, stage=None):
@@ -78,7 +98,7 @@ class MegatronCLIPFeatureFusionModel(MegatronCLIPModel):
         # Batch size need to be provided for dataset
         self._num_micro_batches = get_num_microbatches()
         self._micro_batch_size = self.cfg.micro_batch_size
-
+        self.setup_training_data()
         # when using pipeline model parallel the final stage need to initialize word embeddings
         if parallel_state.get_pipeline_model_parallel_world_size() > 1:
             if isinstance(self.model, list):
@@ -161,9 +181,18 @@ class MegatronCLIPFeatureFusionModel(MegatronCLIPModel):
 
         txt_batched = batch["txt_batched"]
         image_batched = batch["image_batched"] #[bs, width, img_h, img_w]
+        txt_mask_batched = batch["txt_mask_batched"]
+        image_mask_batched = batch["image_mask_batched"]
         index_mapping = batch["index_mapping"]
+
+        ###########
+        #This is for getting [bs, seq_len, embed_dimension]
         text_features = self.encode_text(txt_batched)
         image_features = self.encode_image(image_batched)
+        # output_tensor = self.model(image_batched, txt_batched)
+        # image_features, text_features, _ = output_tensor
+        # image_features = image_features.unsqueeze(dim=1)
+        # text_features = text_features.unsqueeze(dim=1)
         combined_features = torch.cat([text_features, image_features], dim=1) # shape: [batch_size, seq_len, embed_dim]
         transformer_output = self.t5_layers(
             inputs_embeds=combined_features,
@@ -175,11 +204,16 @@ class MegatronCLIPFeatureFusionModel(MegatronCLIPModel):
             return torch.mean(embeddings, dim=1)
         # Pool the output of the T5 transformer to get the final features
         embeddings = mean_pooling(transformer_output.last_hidden_state)
+        ########
+        # output_tensor = self.model(image_batched, txt_batched)
+        # image_features, text_features, _ = output_tensor
+        # embeddings = image_features * image_mask_batched.unsqueeze(-1) + text_features * txt_mask_batched.unsqueeze(-1)
+
         query_embeds = embeddings[torch.tensor(index_mapping["query"]).flatten()]
         pos_cand_embeds = embeddings[torch.tensor(index_mapping["pos_cand"]).flatten()]
-        output_tensor = query_embeds, pos_cand_embeds
+        output_tensors = query_embeds, pos_cand_embeds
 
-        return output_tensor
+        return output_tensors
 
     def get_forward_output_and_loss_func(self):
         loss_func = InbatchContrastiveLoss(
@@ -210,3 +244,41 @@ class MegatronCLIPFeatureFusionModel(MegatronCLIPModel):
             return outputs, loss_func
 
         return fwd_output_and_loss_func
+
+    def setup_training_data(self):
+
+        val_image_transform, text_transform = get_preprocess_fns(self.cfg, self.tokenizer, is_train=False,)
+        #data loaders
+        self._train_ds = MBEIRMainDataset(
+                        mbeir_data_dir=self.cfg.data_config.mbeir_data_dir,
+                        query_data_path=self.cfg.data_config.train_query_data_path,
+                        cand_pool_path=self.cfg.data_config.train_cand_pool_path,
+                        query_instruct_path=self.cfg.data_config.query_instruct_path,
+                        img_preprocess_fn=val_image_transform,
+                        mode=Mode.TRAIN,
+                        enable_query_instruct=self.cfg.data_config.enable_query_instruct,
+                        shuffle_cand=self.cfg.data_config.shuffle_cand,
+                        hard_neg_num=0, # TODO 
+                        returns=self.cfg.data_config.returns,
+                        ) 
+        train_collector = MBEIRMainCollator(
+                        tokenizer=self.get_tokenizer(),
+                        image_size=tuple(map(int, self.cfg.data_config.image_size.split(','))),
+                        mode=Mode.TRAIN,
+                        )
+        train_sampler = DistributedSampler(
+                        dataset=self._train_ds,
+                        num_replicas=1,
+                        rank=0,
+                        shuffle=True,
+                        )
+        self._train_dl = DataLoader(
+                    dataset=self._train_ds,
+                    batch_size=self.cfg.dataloader_config.train_batch_size,
+                    num_workers=self.cfg.dataloader_config.num_workers,
+                    pin_memory=True,
+                    sampler=train_sampler,
+                    shuffle=False,  # Note: since we use sampler, shuffle should be False
+                    collate_fn=train_collector,
+                    drop_last=True,
+                    )
