@@ -200,6 +200,7 @@ class MegatronCLIPFeatureFusionModel(MegatronCLIPModel):
             use_cache=False,
             return_dict=True
         )
+        
         def mean_pooling(embeddings):
             return torch.mean(embeddings, dim=1)
         # Pool the output of the T5 transformer to get the final features
