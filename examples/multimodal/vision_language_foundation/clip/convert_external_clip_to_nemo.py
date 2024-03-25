@@ -61,11 +61,11 @@ def get_args():
     parser.add_argument(
         "--hparams_file",
         type=str,
-        default=None,
+        default="NeMo_sf/NeMo/examples/multimodal/vision_language_foundation/clip/conf/megatron_clipscorefusion_config.yaml",
         required=False,
         help="Path config for restoring. It's created during training and may need to be modified during restore if restore environment is different than training. Ex: /raid/nemo_experiments/megatron_gpt/hparams.yaml",
     )
-    parser.add_argument("--nemo_file_path", type=str, default=None, required=True, help="Path to output .nemo file.")
+    parser.add_argument("--nemo_file_path", type=str, default="NeMo_sf/NeMo/checkpoint.nemo", required=False, help="Path to output .nemo file.")
     parser.add_argument("--gpus_per_node", type=int, required=False, default=1)
     parser.add_argument("--tensor_model_parallel_size", type=int, required=False, default=1)
     parser.add_argument("--pipeline_model_parallel_size", type=int, required=False, default=1)
@@ -168,8 +168,8 @@ def mapping_hf_state_dict(hf_model):
         ".pre_layrnorm.bias": ".preprocess_layernorm.bias",
         ".post_layernorm.weight": ".transformer.final_layernorm.weight",
         ".post_layernorm.bias": ".transformer.final_layernorm.bias",
-        ".backbone.embeddings.position_embedding.weight": ".backbone.position_embeddings",
-        ".language_model.embeddings.position_embedding.weight": ".language_model.embedding.position_embeddings",
+        ".backbone.embeddings.position_embedding.weight": ".backbone.position_embeddings.weight",
+        ".language_model.embeddings.position_embedding.weight": ".language_model.embedding.position_embeddings.weight",
         ".embeddings.class_embedding": ".cls_token",
         ".backbone.embeddings.patch_embedding.weight": ".backbone.linear_encoder.weight",
         ".final_layer_norm.weight": ".encoder.final_layernorm.weight",
@@ -254,17 +254,14 @@ def convert(local_rank, rank, world_size, args):
 
     app_state.pipeline_model_parallel_rank = parallel_state.get_pipeline_model_parallel_rank()
     app_state.tensor_model_parallel_rank = parallel_state.get_tensor_model_parallel_rank()
-
     cfg = OmegaConf.load(args.hparams_file)
     model = MegatronCLIPModel(cfg.model, trainer)
-
     if args.version == "huggingface":
         hf_model = CLIPModel.from_pretrained(args.arch)
         state_dict = mapping_hf_state_dict(hf_model)
     else:
         open_model, _, _ = open_clip.create_model_and_transforms(args.arch, pretrained=args.version)
         state_dict = mapping_openclip_state_dict(open_model)
-
     model.model.load_state_dict(state_dict)
 
     model._save_restore_connector = NLPSaveRestoreConnector()

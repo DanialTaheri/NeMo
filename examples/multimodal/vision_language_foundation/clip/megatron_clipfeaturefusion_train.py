@@ -16,6 +16,7 @@ from omegaconf.omegaconf import OmegaConf
 from nemo.collections.multimodal.models.vision_language_foundation.clip.megatron_clip_featurefusion_models import (
     MegatronCLIPFeatureFusionModel,
 )
+from nemo.collections.multimodal.parts.utils import load_nemo_model_weights
 from nemo.collections.nlp.parts.megatron_trainer_builder import MegatronTrainerBuilder
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
@@ -37,7 +38,10 @@ def main(cfg) -> None:
     exp_manager(trainer, cfg.exp_manager)
 
     model = MegatronCLIPFeatureFusionModel(cfg.model, trainer)
-    model.train()
+    if cfg.model.restore_from_path.endswith(".nemo") or os.path.isdir(cfg.model.restore_from_path):
+        state_dict = load_nemo_model_weights(cfg.model.restore_from_path)[0]
+        model.load_state_dict(state_dict)
+        
     trainer.fit(model)
 
 
