@@ -28,6 +28,18 @@ from nemo.collections.nlp.models.language_modeling.megatron_t5_model import Mega
 from nemo.collections.nlp.modules.common.megatron.token_level_encoder_decoder import (
     MegatronTokenLevelEncoderDecoderModule,
 )
+from nemo.collections.nlp.modules.common.megatron.megatron_encoders import get_encoder_model
+from nemo.collections.nlp.modules.common.megatron.megatron_decoders import get_decoder_model
+from nemo.collections.nlp.modules.common.megatron.megatron_encoder_decoder import (
+    MegatronTransformerEncoderDecoderModule,
+)
+from nemo.collections.nlp.modules.common.megatron.utils import (
+    ApexGuardDefaults,
+    build_position_ids,
+    init_method_normal,
+    parallel_lm_logits,
+    scaled_init_method_normal,
+)
 try:
     from apex.transformer.enums import AttnMaskType
     from apex.transformer.pipeline_parallel.utils import get_num_microbatches
@@ -45,7 +57,18 @@ try:
 except (ImportError, ModuleNotFoundError):
 
     HAVE_MEGATRON_CORE = False
+try:
+    from apex.transformer.enums import AttnMaskType, ModelType
 
+    HAVE_APEX = True
+
+except (ImportError, ModuleNotFoundError):
+
+    # fake missing classes with None attributes
+    AttnMaskType = ApexGuardDefaults()
+    ModelType = ApexGuardDefaults()
+
+    HAVE_APEX = False
 class MegatronCLIPFeatureFusionModel(MegatronCLIPModel):
     def __init__(self, cfg: DictConfig, trainer: Trainer, pre_process=True, post_process=True):
         super().__init__(cfg, trainer)
@@ -108,42 +131,147 @@ class MegatronCLIPFeatureFusionModel(MegatronCLIPModel):
                     parallel_state.set_virtual_pipeline_model_parallel_rank(i)
                 parallel_state.set_virtual_pipeline_model_parallel_rank(0)
         #ToDo: check the configuration of megatron_T5 model and replace this
-        # conf_t5 = T5Config()
-        # conf_t5.num_layers = 2
-        # conf_t5.num_decoder_layers = 2
-        # conf_t5.num_heads = 12
-        # conf_t5.d_model = 512
-        # conf_t5.d_kv = 64
-        # self.t5_layers = T5Stack(conf_t5)
-        self.t5_layers = MegatronTokenLevelEncoderDecoderModule(
-            config=self.model_parallel_config,
-            encoder_cfg=self.cfg.t5,
-            decoder_cfg=self.cfg.t5,
-            vocab_size=self.padded_vocab_size,
-            max_position_embeddings=512,
-            num_tokentypes=0,
-            parallel_output=True,
-            pre_process=False,
-            post_process=False,
-            fp16_cross_entropy=self.cfg.get('fp16_lm_cross_entropy', False),
-            precision=self.cfg.get('precision', 16),
-            embedding_init_method_std=0.02,
-            embedding_dropout=0.1,
-            label_smoothing=self.cfg.get('label_smoothing', 0.0),
-            add_encoder=True,
-            add_decoder=True,
-            share_token_embeddings=self.cfg.get('share_token_embeddings', True),
-            share_decoder_tokens_head_embeddings=self.cfg.get('share_decoder_tokens_head_embeddings', True),
-            tokens_head_bias=self.cfg.get('tokens_head_bias', True),
-            hiddens_cfg=self.cfg.get('hiddens', None),
-        )
-        #import pdb;pdb.set_trace()
+        conf_t5 = T5Config()
+        conf_t5.num_layers = 2
+        conf_t5.num_decoder_layers = 2
+        conf_t5.num_heads = 12
+        conf_t5.d_model = 512
+        conf_t5.d_kv = 64
+        self.t5_layers = T5Stack(conf_t5)
+
+        # encoder = get_encoder_model(
+        #         config=self.cfg.t5,
+        #         arch=self.cfg.t5.arch,
+        #         hidden_size=self.cfg.t5.hidden_size,
+        #         ffn_hidden_size=self.cfg.t5.ffn_hidden_size,
+        #         num_layers=self.cfg.t5.num_layers,
+        #         num_attention_heads=self.cfg.t5.num_attention_heads,
+        #         apply_query_key_layer_scaling=self.cfg.t5.get('apply_query_key_layer_scaling', True),
+        #         kv_channels=self.cfg.t5.kv_channels,
+        #         init_method=init_method_normal(self.cfg.t5.get('init_method_std', 0.02)),
+        #         scaled_init_method=scaled_init_method_normal(
+        #             self.cfg.t5.get('init_method_std', 0.02), self.cfg.t5.num_layers
+        #         ),
+        #         encoder_attn_mask_type=AttnMaskType.padding,
+        #         pre_process=True,
+        #         post_process=False,
+        #         init_method_std=self.cfg.t5.get('init_method_std', 0.02),
+        #         hidden_dropout=self.cfg.t5.get('hidden_dropout', 0.1),
+        #         attention_dropout=self.cfg.t5.get('attention_dropout', 0.1),
+        #         ffn_dropout=self.cfg.t5.get('ffn_dropout', 0.0),
+        #         precision=self.cfg.get('precision', 16),
+        #         fp32_residual_connection=self.cfg.t5.get('fp32_residual_connection', False),
+        #         activations_checkpoint_method=self.cfg.t5.get('activations_checkpoint_method', None),
+        #         activations_checkpoint_num_layers=self.cfg.t5.get('activations_checkpoint_num_layers', 1),
+        #         activations_checkpoint_granularity=self.cfg.t5.get('activations_checkpoint_granularity', None),
+        #         layernorm_epsilon=self.cfg.t5.get('layernorm_epsilon', 1e-5),
+        #         bias_activation_fusion=self.cfg.t5.get('bias_activation_fusion', True),
+        #         bias_dropout_add_fusion=self.cfg.t5.get('bias_dropout_add_fusion', True),
+        #         masked_softmax_fusion=self.cfg.t5.get('masked_softmax_fusion', True),
+        #         persist_layer_norm=self.cfg.t5.get('persist_layer_norm', True),
+        #         openai_gelu=self.cfg.t5.get('openai_gelu', False),
+        #         onnx_safe=self.cfg.t5.get('onnx_safe', False),
+        #         hidden_steps=self.cfg.t5.get('hidden_steps', -1),
+        #         activation=self.cfg.t5.get('activation', 'gelu'),
+        #         bias=self.cfg.t5.get('bias', True),
+        #         normalization=self.cfg.t5.get('normalization', 'layernorm'),
+        #         transformer_block_type=self.cfg.t5.get('transformer_block_type', 'pre_ln'),
+        #         headscale=self.cfg.t5.get('headscale', False),
+        #         parent_model_type=ModelType.encoder_and_decoder,
+        #         num_self_attention_per_cross_attention=self.cfg.t5.get('num_self_attention_per_cross_attention', 1),
+        #         megatron_legacy=self.cfg.t5.get('megatron_legacy', False),
+        #         normalize_attention_scores=self.cfg.t5.get('normalize_attention_scores', True),
+        #         num_moe_experts=self.cfg.t5.get('num_moe_experts', 1),
+        #         moe_frequency=self.cfg.t5.get('moe_frequency', 1),
+        #         moe_dropout=self.cfg.t5.get('moe_dropout', 0.0),
+        #         position_embedding_type=self.cfg.t5.get('position_embedding_type', 'learned_absolute'),
+        #         use_flash_attention=self.cfg.t5.get('use_flash_attention', False),
+        #     )
+
+        # decoder = get_decoder_model(
+        #         config=self.cfg.t5,
+        #         arch=self.cfg.t5.arch,
+        #         hidden_size=self.cfg.t5.hidden_size,
+        #         ffn_hidden_size=self.cfg.t5.ffn_hidden_size,
+        #         num_layers=self.cfg.t5.num_layers,
+        #         num_attention_heads=self.cfg.t5.num_attention_heads,
+        #         apply_query_key_layer_scaling=self.cfg.t5.get('apply_query_key_layer_scaling', True),
+        #         kv_channels=self.cfg.t5.kv_channels,
+        #         init_method=init_method_normal(self.cfg.t5.get('init_method_std', 0.02)),
+        #         scaled_init_method=scaled_init_method_normal(
+        #             self.cfg.t5.get('init_method_std', 0.02), self.cfg.t5.num_layers
+        #         ),
+        #         decoder_attn_mask_type=AttnMaskType.causal,
+        #         pre_process=False,
+        #         post_process=False,
+        #         init_method_std=self.cfg.t5.get('init_method_std', 0.02),
+        #         hidden_dropout=self.cfg.t5.get('hidden_dropout', 0.1),
+        #         attention_dropout=self.cfg.t5.get('attention_dropout', 0.1),
+        #         ffn_dropout=self.cfg.t5.get('ffn_dropout', 0.0),
+        #         precision=self.cfg.get('precision', 16),
+        #         fp32_residual_connection=self.cfg.t5.get('fp32_residual_connection', False),
+        #         activations_checkpoint_method=self.cfg.t5.get('activations_checkpoint_method', None),
+        #         activations_checkpoint_num_layers=self.cfg.t5.get('activations_checkpoint_num_layers', 1),
+        #         activations_checkpoint_granularity=self.cfg.t5.get('activations_checkpoint_granularity', None),
+        #         layernorm_epsilon=self.cfg.t5.get('layernorm_epsilon', 1e-5),
+        #         bias_activation_fusion=self.cfg.t5.get('bias_activation_fusion', True),
+        #         bias_dropout_add_fusion=self.cfg.t5.get('bias_dropout_add_fusion', True),
+        #         masked_softmax_fusion=self.cfg.t5.get('masked_softmax_fusion', True),
+        #         persist_layer_norm=self.cfg.t5.get('persist_layer_norm', True),
+        #         openai_gelu=self.cfg.t5.get('openai_gelu', False),
+        #         onnx_safe=self.cfg.t5.get('onnx_safe', False),
+        #         hidden_steps=self.cfg.t5.get('hidden_steps', -1),
+        #         activation=self.cfg.t5.get('activation', 'gelu'),
+        #         bias=self.cfg.t5.get('bias', True),
+        #         normalization=self.cfg.t5.get('normalization', 'layernorm'),
+        #         transformer_block_type=self.cfg.t5.get('transformer_block_type', 'pre_ln'),
+        #         headscale=self.cfg.t5.get('headscale', False),
+        #         parent_model_type=ModelType.encoder_and_decoder,
+        #         megatron_legacy=self.cfg.t5.get('megatron_legacy', False),
+        #         normalize_attention_scores=self.cfg.t5.get('normalize_attention_scores', True),
+        #         num_moe_experts=self.cfg.t5.get('num_moe_experts', 1),
+        #         moe_frequency=self.cfg.t5.get('moe_frequency', 1),
+        #         moe_dropout=self.cfg.t5.get('moe_dropout', 0.0),
+        #         position_embedding_type=self.cfg.t5.get('position_embedding_type', 'learned_absolute'),
+        #         use_flash_attention=self.cfg.t5.get('use_flash_attention', False),
+        #     )
+        # self.enc_dec_model = MegatronTransformerEncoderDecoderModule(
+        #     config=self.cfg.t5,
+        #     encoder=encoder,
+        #     decoder=decoder,
+        #     hidden_steps=encoder_cfg.get('hidden_steps', -1),
+        #     hiddens_module=hiddens_module,
+        # )
+        
+        # import pdb; pdb.set_trace()
+        # self.t5_layers = MegatronTokenLevelEncoderDecoderModule(
+        #     config=self.model_parallel_config,
+        #     encoder_cfg=self.cfg.t5,
+        #     decoder_cfg=self.cfg.t5,
+        #     vocab_size=self.padded_vocab_size,
+        #     max_position_embeddings=512,
+        #     num_tokentypes=0,
+        #     parallel_output=True,
+        #     pre_process=True,
+        #     post_process=True,
+        #     fp16_cross_entropy=self.cfg.get('fp16_lm_cross_entropy', False),
+        #     precision=self.cfg.get('precision', 16),
+        #     embedding_init_method_std=0.02,
+        #     embedding_dropout=0.1,
+        #     label_smoothing=self.cfg.get('label_smoothing', 0.0),
+        #     add_encoder=True,
+        #     add_decoder=False,
+        #     share_token_embeddings=self.cfg.get('share_token_embeddings', True),
+        #     share_decoder_tokens_head_embeddings=self.cfg.get('share_decoder_tokens_head_embeddings', True),
+        #     tokens_head_bias=self.cfg.get('tokens_head_bias', True),
+        #     hiddens_cfg=self.cfg.get('hiddens', None),
+        # )
     def encode_text(self, text_tensor):
         """ 
         text_tensor [bs, seq_len]
         output_tensor [bs, seq_len, hidden_size]
         """
-        output_tensor = self.model.text_encoder(text_tensor)
+        #output_tensor = self.model.text_encoder(text_tensor)
         x = self.model.text_encoder.language_model.embedding.word_embeddings(text_tensor) # [batch_size, seq_len, d_model]
         x = x + self.model.text_encoder.language_model.embedding.position_embeddings.weight
         x = x.permute(1, 0, 2)  # NLD -> LND
@@ -224,7 +352,10 @@ class MegatronCLIPFeatureFusionModel(MegatronCLIPModel):
         #     use_cache=False,
         #     return_dict=True
         # )
-        transformer_output = self.t5_layers(enc_input=combined_features)
+        # enc_attn_mask = torch.ones(combined_features.shape[0], combined_features.shape[1], dtype=torch.bool).to('cuda')
+        # dec_attn_mask = torch.ones(combined_features.shape[0], combined_features.shape[1], dtype=torch.bool).to('cuda')
+        #import pdb; pdb.set_trace()
+        #transformer_output = self.t5_layers(enc_input=combined_features, enc_attn_mask=enc_attn_mask, dec_attn_mask=dec_attn_mask)
         def mean_pooling(embeddings):
             return torch.mean(embeddings, dim=1)
         # Pool the output of the T5 transformer to get the final features
