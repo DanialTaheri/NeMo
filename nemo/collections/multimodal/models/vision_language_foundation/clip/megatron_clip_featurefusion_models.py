@@ -131,13 +131,13 @@ class MegatronCLIPFeatureFusionModel(MegatronCLIPModel):
                     parallel_state.set_virtual_pipeline_model_parallel_rank(i)
                 parallel_state.set_virtual_pipeline_model_parallel_rank(0)
         #ToDo: check the configuration of megatron_T5 model and replace this
-        conf_t5 = T5Config()
-        conf_t5.num_layers = 2
-        conf_t5.num_decoder_layers = 2
-        conf_t5.num_heads = 12
-        conf_t5.d_model = 512
-        conf_t5.d_kv = 64
-        self.t5_layers = T5Stack(conf_t5)
+        # conf_t5 = T5Config()
+        # conf_t5.num_layers = 2
+        # conf_t5.num_decoder_layers = 2
+        # conf_t5.num_heads = 12
+        # conf_t5.d_model = 512
+        # conf_t5.d_kv = 64
+        # self.t5_layers = T5Stack(conf_t5)
 
         # encoder = get_encoder_model(
         #         config=self.cfg.t5,
@@ -244,28 +244,28 @@ class MegatronCLIPFeatureFusionModel(MegatronCLIPModel):
         # )
         
         # import pdb; pdb.set_trace()
-        # self.t5_layers = MegatronTokenLevelEncoderDecoderModule(
-        #     config=self.model_parallel_config,
-        #     encoder_cfg=self.cfg.t5,
-        #     decoder_cfg=self.cfg.t5,
-        #     vocab_size=self.padded_vocab_size,
-        #     max_position_embeddings=512,
-        #     num_tokentypes=0,
-        #     parallel_output=True,
-        #     pre_process=True,
-        #     post_process=True,
-        #     fp16_cross_entropy=self.cfg.get('fp16_lm_cross_entropy', False),
-        #     precision=self.cfg.get('precision', 16),
-        #     embedding_init_method_std=0.02,
-        #     embedding_dropout=0.1,
-        #     label_smoothing=self.cfg.get('label_smoothing', 0.0),
-        #     add_encoder=True,
-        #     add_decoder=False,
-        #     share_token_embeddings=self.cfg.get('share_token_embeddings', True),
-        #     share_decoder_tokens_head_embeddings=self.cfg.get('share_decoder_tokens_head_embeddings', True),
-        #     tokens_head_bias=self.cfg.get('tokens_head_bias', True),
-        #     hiddens_cfg=self.cfg.get('hiddens', None),
-        # )
+        self.t5_layers = MegatronTokenLevelEncoderDecoderModule(
+            config=self.model_parallel_config,
+            encoder_cfg=self.cfg.t5,
+            decoder_cfg=self.cfg.t5,
+            vocab_size=self.padded_vocab_size,
+            max_position_embeddings=512,
+            num_tokentypes=0,
+            parallel_output=True,
+            pre_process=True,
+            post_process=False,
+            fp16_cross_entropy=self.cfg.get('fp16_lm_cross_entropy', False),
+            precision=self.cfg.get('precision', 16),
+            embedding_init_method_std=0.02,
+            embedding_dropout=0.1,
+            label_smoothing=self.cfg.get('label_smoothing', 0.0),
+            add_encoder=True,
+            add_decoder=True,
+            share_token_embeddings=self.cfg.get('share_token_embeddings', True),
+            share_decoder_tokens_head_embeddings=self.cfg.get('share_decoder_tokens_head_embeddings', True),
+            tokens_head_bias=self.cfg.get('tokens_head_bias', True),
+            hiddens_cfg=self.cfg.get('hiddens', None),
+        )
     def encode_text(self, text_tensor):
         """ 
         text_tensor [bs, seq_len]
@@ -352,10 +352,10 @@ class MegatronCLIPFeatureFusionModel(MegatronCLIPModel):
         #     use_cache=False,
         #     return_dict=True
         # )
-        # enc_attn_mask = torch.ones(combined_features.shape[0], combined_features.shape[1], dtype=torch.bool).to('cuda')
-        # dec_attn_mask = torch.ones(combined_features.shape[0], combined_features.shape[1], dtype=torch.bool).to('cuda')
+        enc_attn_mask = torch.ones(combined_features.shape[0], combined_features.shape[1], dtype=torch.bool).to('cuda')
+        dec_attn_mask = torch.ones(combined_features.shape[0], combined_features.shape[1], dtype=torch.bool).to('cuda')
         #import pdb; pdb.set_trace()
-        #transformer_output = self.t5_layers(enc_input=combined_features, enc_attn_mask=enc_attn_mask, dec_attn_mask=dec_attn_mask)
+        transformer_output = self.t5_layers(enc_input=combined_features, enc_attn_mask=enc_attn_mask, dec_attn_mask=dec_attn_mask)
         def mean_pooling(embeddings):
             return torch.mean(embeddings, dim=1)
         # Pool the output of the T5 transformer to get the final features
