@@ -2,15 +2,15 @@ trainer:
   devices: 1
   num_nodes: 1
   accelerator: gpu
-  precision: 16
+  precision: 32
   logger: False # logger provided by exp_manager
   enable_checkpointing: False
   use_distributed_sampler: False
   max_epochs: -1 # PTL default. In practice, max_steps will be reached first.
-  max_steps: 15000 # consumed_samples = global_step * micro_batch_size * data_parallel_size * accumulate_grad_batches
+  max_steps: 208240 # consumed_samples = global_step * micro_batch_size * data_parallel_size * accumulate_grad_batches
   log_every_n_steps: 10
   val_check_interval: 100
-  check_val_every_n_epoch: null
+  check_val_every_n_epoch: 1
   limit_val_batches: 50
   limit_test_batches: 500
   accumulate_grad_batches: 1 # do not modify, grad acc is automatic for training megatron models
@@ -21,8 +21,8 @@ trainer:
 exp_manager:
   explicit_log_dir: null
   exp_dir: null
-  name: megatron_clip
-  create_wandb_logger: False
+  name: megatron_clipfeaturefusion
+  create_wandb_logger: True
   wandb_logger_kwargs:
     entity: smohsenitahe
     project: multimodal-retriever-nemo
@@ -48,16 +48,16 @@ exp_manager:
 
     
 model:
-  precision: ${trainer.precision}
+  precision: 32
   # specify micro_batch_size, global_batch_size, and model parallelism
   # gradient accumulation will be done automatically based on data_parallel_size
-  micro_batch_size: 105 # limited by GPU memory
-  global_batch_size: 105 # will use more micro batches to reach global batch size
+  micro_batch_size: 128 # limited by GPU memory
+  global_batch_size: 128 # will use more micro batches to reach global batch size
   tensor_model_parallel_size: 1 # intra-layer model parallelism
   pipeline_model_parallel_size: 1 # inter-layer model parallelism
   virtual_pipeline_model_parallel_size: null # interleaved pipeline
 
-  restore_from_path: NeMo_sf/NeMo/checkpoint.nemo
+  restore_from_path: NeMo_sf/NeMo/checkpoint_conv.nemo # used in fine-tuning
   # multimodal configs
   output_dim: 512
   #  As the number of devices used to train increases, so does the space complexity of
@@ -65,11 +65,11 @@ model:
   #  `O(n^2)`. Instead, complexity may become effectively linear if the flags
   #  `--gather-with-grad` and `--local-loss` are used. This alteration results in one-to-one
   #  numerical results as the naïve method.
-  local_loss: False # calculate loss w/ local features @ global (instead of realizing full global @ global matrix)
+  local_loss: True # calculate loss w/ local features @ global (instead of realizing full global @ global matrix)
   gather_with_grad: True # enable full distributed gradient for feature gather, set this to False may cause convergence issue
 
   vision:
-    precision: ${trainer.precision}
+    precision: 32
     # vision configs
     patch_dim: 32
     img_h: 224
@@ -81,14 +81,13 @@ model:
     drop_path_rate: 0.0
     global_average_pool: False
     output_dim: ${model.output_dim}
-    #class_token_length: 8
     class_token_length: 1
     preprocess_layernorm: True # apply layer norm to embedded tokens
 
     # model architecture
-    encoder_seq_length: 196
+    encoder_seq_length: 49
     max_position_embeddings: ${.encoder_seq_length}
-    position_embedding_type: learned_absolute
+    position_embedding_type: learned_parameters
     num_layers: 12
     hidden_size: 768
     ffn_hidden_size: 3072 # Transformer FFN hidden size. Usually 4 * hidden_size.
@@ -128,18 +127,20 @@ model:
     gradient_accumulation_fusion: False # Fuse weight gradient accumulation to GEMMs. Only used with pipeline parallelism.
     openai_gelu: False
     bias_activation_fusion: False
-    megatron_legacy: False
+    megatron_legacy: True
+    activation: approx-gelu
+
 
 
   text:
-    precision: ${trainer.precision}
+    precision: 32
     # text configs
     output_dim: ${model.output_dim}
 
     # model architecture
     encoder_seq_length: 77
     max_position_embeddings: ${.encoder_seq_length}
-    position_embedding_type: learned_absolute
+    position_embedding_type: learned_parameters
     num_layers: 12
     hidden_size: 512
     ffn_hidden_size: 2048 # Transformer FFN hidden size. Usually 4 * hidden_size.
@@ -181,7 +182,7 @@ model:
     gradient_accumulation_fusion: False # Fuse weight gradient accumulation to GEMMs. Only used with pipeline parallelism.
     openai_gelu: False
     bias_activation_fusion: False
-    megatron_legacy: False
+    megatron_legacy: True
 
     transformer_engine: False
     fp8: False # enables fp8 in TransformerLayer forward
@@ -192,6 +193,7 @@ model:
     fp8_amax_history_len: 1 # Number of steps for which amax history is recorded per tensor
     fp8_amax_compute_algo: most_recent # 'most_recent' or 'max'. Algorithm for computing amax from history
     use_emha: False # Use fused multi-head attention for large sequence-length. Note this is not yet supported. Please set to False.
+    activation: approx-gelu
 
   # Megatron O2-style half-precision
   megatron_amp_O2: False # Enable O2-level automatic mixed precision using main parameters
@@ -199,7 +201,7 @@ model:
   grad_div_ar_fusion: True # Fuse grad division into torch.distributed.all_reduce
 
   # miscellaneous
-  seed: 2023
+  seed: 1234
   resume_from_checkpoint: null # manually set the checkpoint file to load from
   apex_transformer_log_level: 30 # Python logging level displays logs with severity greater than or equal to this
   gradient_as_bucket_view: True # PyTorch DDP argument. Allocate gradients in a contiguous bucket to save memory (less fragmentation and buffer memory)
@@ -213,7 +215,7 @@ model:
     delimiter: null # only used for tabular tokenizer
     sentencepiece_legacy: False # Legacy=True allows you to add special tokens to sentencepiece tokenizers.
   make_vocab_size_divisible_by: 128 # Pad the vocab size to be divisible by this value for computation efficiency.
-  
+
   # Nsys profiling options
   nsys_profile:
     enabled: False
@@ -223,9 +225,20 @@ model:
     gen_shape: False # Generate model and kernel details including input shapes
 
   optim:
-    name: adam
+    name: adamw
     lr: 1e-5
+    weight_decay: 0.2
+    betas:
+      - 0.9
+      - 0.98
+    sched:
+      name: CosineAnnealing
+      warmup_steps: 0
+      constant_steps: 0
+      max_steps: ${trainer.max_steps}
+      min_lr: 1e-5
 
+      
   data_config:
     image_size: 224, 224
     hard_neg_num: 0
@@ -248,8 +261,8 @@ model:
     
   # DataLoader settings
   dataloader_config:
-    num_workers: 5 
-    train_batch_size: 105  # 78597MiB / 81559MiB
+    num_workers: 0 
+    train_batch_size: 128  # 78597MiB / 81559MiB
     valid_batch_size: 2048
 
   t5:

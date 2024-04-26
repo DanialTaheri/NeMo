@@ -38,9 +38,9 @@ def main(cfg) -> None:
     exp_manager(trainer, cfg.exp_manager)
 
     model = MegatronCLIPFeatureFusionModel(cfg.model, trainer)
-    if cfg.model.restore_from_path.endswith(".nemo") or os.path.isdir(cfg.model.restore_from_path):
-        state_dict = load_nemo_model_weights(cfg.model.restore_from_path)[0]
-        model.load_state_dict(state_dict)
+    # if cfg.model.restore_from_path.endswith(".nemo") or os.path.isdir(cfg.model.restore_from_path):
+    #     state_dict = load_nemo_model_weights(cfg.model.restore_from_path)[0]
+    #     model.load_state_dict(state_dict)
     trainer.fit(model)
 
 
