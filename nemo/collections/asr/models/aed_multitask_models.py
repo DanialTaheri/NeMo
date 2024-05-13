@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import ceil
 from typing import Any, Dict, List, Optional, Union
 
@@ -40,7 +40,7 @@ from nemo.collections.asr.parts.utils import manifest_utils
 from nemo.collections.asr.parts.utils.audio_utils import ChannelSelectorType
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 from nemo.collections.common import tokenizers
-from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
+from nemo.collections.common.data.lhotse.dataloader import get_lhotse_dataloader_from_config
 from nemo.collections.common.metrics import GlobalAverageLossMetric
 from nemo.collections.common.parts import transformer_weights_init
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
@@ -103,8 +103,18 @@ class MultiTaskTranscriptionConfig(TranscribeConfig):
     pnc: Optional[bool] = None
     source_lang: Optional[str] = None
     target_lang: Optional[str] = None
+    text_field: str = "answer"
+    lang_field: str = "target_lang"
 
-    _internal: Optional[MultiTaskTranscriptionInternalConfig] = None
+    _internal: Optional[MultiTaskTranscriptionInternalConfig] = field(
+        default_factory=lambda: MultiTaskTranscriptionInternalConfig()
+    )
+
+    def __post_init__(self):
+        required_fields = ['task', 'pnc', 'source_lang', 'target_lang', 'text_field', 'lang_field']
+        for field in required_fields:
+            if not hasattr(self, field):
+                raise ValueError(f"`{field}` must be present in the transcription config: {self}")
 
 
 class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRTranscriptionMixin):
@@ -747,7 +757,10 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRTran
         manifest_filepath = None
         if len(audio_files) == 1 and isinstance(audio_files[0], str):
             # Check if manifest file is provided
-            if hasattr(trcfg._internal, 'manifest_filepath'):
+            if (
+                hasattr(trcfg._internal, 'manifest_filepath')
+                and getattr(trcfg._internal, 'manifest_filepath') is not None
+            ):
                 manifest_filepath = trcfg._internal.manifest_filepath
 
             elif audio_files[0].endswith('.json') or audio_files[0].endswith('.jsonl'):
@@ -860,8 +873,9 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRTran
             'use_lhotse': True,
             'use_bucketing': False,
             'drop_last': False,
-            'text_field': 'answer',
-            'lang_field': 'target_lang',
+            'text_field': config.get('text_field', 'answer'),
+            'lang_field': config.get('lang_field', 'target_lang'),
+            'channel_selector': config.get('channel_selector', None),
         }
 
         temporary_datalayer = self._setup_dataloader_from_config(config=DictConfig(dl_config), inference=True)
@@ -901,7 +915,7 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRTran
                     'taskname': 'asr' if trcfg.task is None else trcfg.task,
                     'target_lang': 'en' if trcfg.target_lang is None else trcfg.target_lang,
                     'pnc': 'yes' if trcfg.pnc is None else 'yes' if trcfg.pnc else 'no',
-                    'answer': 'nothing',
+                    trcfg.text_field: 'nothing',
                 }
             elif isinstance(item, dict):
                 entry = item
@@ -915,6 +929,8 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRTran
                     entry['target_lang'] = 'en' if trcfg.target_lang is None else trcfg.target_lang
                 if 'pnc' not in entry:
                     entry['pnc'] = 'yes' if trcfg.pnc is None else 'yes' if trcfg.pnc else 'no'
+                if trcfg.text_field not in entry:
+                    entry[trcfg.text_field] = 'nothing'
             else:
                 raise ValueError(f"Expected str or dict, got {type(item)}")
             out_json_items.append(entry)

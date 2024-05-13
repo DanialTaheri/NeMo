@@ -20,7 +20,6 @@ from pytorch_lightning import Trainer
 from torch._inductor import config as inductor_config
 
 from nemo.collections.multimodal.data.dreambooth.dreambooth_dataset import DreamBoothDataset
-from nemo.collections.multimodal.modules.stable_diffusion.attention import LinearWrapper
 from nemo.collections.multimodal.modules.stable_diffusion.distributions.distributions import (
     DiagonalGaussianDistribution,
 )
@@ -241,7 +240,7 @@ class MegatronDreamBooth(NLPAdapterModelMixin, MegatronBaseModel):
         output_tensor = self.model(batch)
         return output_tensor
 
-    def fwd_bwd_step(self, dataloader_iter, batch_idx, forward_only):
+    def fwd_bwd_step(self, dataloader_iter, forward_only):
         tensor_shape = None  # Placeholder
 
         # handle asynchronous grad reduction
@@ -290,7 +289,7 @@ class MegatronDreamBooth(NLPAdapterModelMixin, MegatronBaseModel):
 
         return loss_mean, loss_dict
 
-    def training_step(self, dataloader_iter, batch_idx):
+    def training_step(self, dataloader_iter):
         """
             Our dataloaders produce a micro-batch and then we fetch
             a number of microbatches depending on the global batch size and model parallel size
@@ -303,7 +302,7 @@ class MegatronDreamBooth(NLPAdapterModelMixin, MegatronBaseModel):
         # we zero grads here because we also call backward in the apex fwd/bwd functions
         self._optimizer.zero_grad()
 
-        loss_mean, loss_dict = self.fwd_bwd_step(dataloader_iter, batch_idx, False)
+        loss_mean, loss_dict = self.fwd_bwd_step(dataloader_iter, False)
 
         torch.distributed.broadcast(loss_mean, get_last_rank())
 
@@ -344,8 +343,8 @@ class MegatronDreamBooth(NLPAdapterModelMixin, MegatronBaseModel):
         )
         return loss_mean
 
-    def validation_step(self, dataloader_iter, batch_idx):
-        loss, val_loss_dict = self.fwd_bwd_step(dataloader_iter, batch_idx, True)
+    def validation_step(self, dataloader_iter):
+        loss, val_loss_dict = self.fwd_bwd_step(dataloader_iter, True)
 
         self.log_dict(val_loss_dict, prog_bar=False, logger=True, on_step=False, on_epoch=True, batch_size=1)
 
@@ -394,7 +393,7 @@ class MegatronDreamBooth(NLPAdapterModelMixin, MegatronBaseModel):
             return images, cond
 
         def fwd_output_and_loss_func(dataloader_iter, model):
-            batch = next(dataloader_iter)
+            batch, _, _ = next(dataloader_iter)
             batch = process_batch(batch)
             batch = [x.cuda(non_blocking=True) for x in batch]
             loss = model(batch)
@@ -647,6 +646,8 @@ class MegatronDreamBooth(NLPAdapterModelMixin, MegatronBaseModel):
         return checkpoint
 
     def _check_and_add_adapter(self, name, module, peft_name, peft_cfg, name_key_to_mcore_mixins=None):
+        from nemo.collections.multimodal.modules.stable_diffusion.attention import LinearWrapper
+
         if isinstance(module, AdapterModuleMixin):
             if isinstance(module, LinearWrapper):
                 peft_cfg.in_features, peft_cfg.out_features = module.in_features, module.out_features

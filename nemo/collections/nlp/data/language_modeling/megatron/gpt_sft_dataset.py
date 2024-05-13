@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import re
 from typing import List, Mapping, Optional
 
@@ -60,10 +61,12 @@ class GPTSFTDataset(Dataset):
         special_tokens: Optional[Mapping[str, str]] = None,  # special tokens, a dictory of {token_type: token}
         is_test: bool = False,
         output_original_text: bool = False,
+        ceil_to_power_2: bool = False,
+        get_attention_mask_from_fusion: bool = False,
     ):
         """
         file_path: Path to a JSONL GPT supervised fine-tuning dataset. Data is formatted as multiple JSON lines with each line formatted as follows. {'input': 'John von Neumann\nVon Neumann made fundamental contributions .... Q: What did the math of artificial viscosity do?', 'output': 'smoothed the shock transition without sacrificing basic physics'}
-        tokenizer: Tokenizer for the dataset. Instance of a class that inherits TokenizerSpec (ex: YTTM, SentencePiece).
+        tokenizer: Tokenizer for the dataset. Instance of a class that inherits TokenizerSpec (ex: SentencePiece).
         max_seq_length (int): maximum sequence length for each dataset examples. Examples will either be truncated to fit this length or dropped if they cannot be truncated.
         min_seq_length (int): min length of each data example in the dataset. Data examples will be dropped if they do not meet the min length requirements.
         add_bos (bool): Whether to add a beginning of sentence token to each data example
@@ -104,9 +107,14 @@ class GPTSFTDataset(Dataset):
         self.prompt_template = prompt_template
         self.virtual_tokens = virtual_tokens
         self.tokens_to_generate = tokens_to_generate
+        self.memmap_workers = memmap_workers
+        self.hf_dataset = hf_dataset
         self.truncation_method = truncation_method
         self.is_test = is_test
         self.output_original_text = output_original_text
+        self.ceil_to_power_2 = ceil_to_power_2
+        self.get_attention_mask_from_fusion = get_attention_mask_from_fusion
+
         if special_tokens is None:
             self.special_tokens = {
                 "system_turn_start": "<extra_id_0>",
@@ -118,24 +126,31 @@ class GPTSFTDataset(Dataset):
         else:
             self.special_tokens = special_tokens
 
-        if hf_dataset:
-            self.indexed_dataset = load_dataset(
-                'json', data_files=file_path, cache_dir=index_mapping_dir, num_proc=memmap_workers, split='train'
-            )
-        else:
-            self.indexed_dataset = JSONLMemMapDataset(
-                dataset_paths=[file_path],
-                tokenizer=None,
-                header_lines=0,
-                index_mapping_dir=index_mapping_dir,
-                workers=memmap_workers,
-            )
+        self._load_dataset()
 
         # Validate prompt template
         self._maybe_validate_prompt_template()
 
         # Will be None after this call if `max_num_samples` is None
         self._build_samples_mapping()
+
+    def _load_dataset(self):
+        if self.hf_dataset:
+            self.indexed_dataset = load_dataset(
+                'json',
+                data_files=self.file_path,
+                cache_dir=self.index_mapping_dir,
+                num_proc=self.memmap_workers,
+                split='train',
+            )
+        else:
+            self.indexed_dataset = JSONLMemMapDataset(
+                dataset_paths=[self.file_path],
+                tokenizer=None,
+                header_lines=0,
+                index_mapping_dir=self.index_mapping_dir,
+                workers=self.memmap_workers,
+            )
 
     def _maybe_validate_prompt_template(self):
         assert (
@@ -397,7 +412,11 @@ class GPTSFTDataset(Dataset):
         return x
 
     def _ceil_to_nearest(self, n, m):
-        return (n + m - 1) // m * m
+        if self.ceil_to_power_2:
+            # Reccurent Gemma (AKA Griffin) requires seq length to be a power of 2 for parallel scan
+            return 2 ** math.ceil(math.log2(n))
+        else:
+            return (n + m - 1) // m * m
 
     def _collate_item(self, item, max_length, pad_id):
         item = self._maybe_cast_to_list(item)
@@ -447,8 +466,9 @@ class GPTSFTDataset(Dataset):
             max_length = min(self.max_seq_length, self._ceil_to_nearest(max_length, self.pad_seq_length_to_mult))
         assert max_length <= self.max_seq_length
 
-        attention_mask = [self._create_attention_mask(max_length) for _ in batch]
-        attention_mask = torch.stack(attention_mask)
+        if not self.get_attention_mask_from_fusion:
+            attention_mask = [self._create_attention_mask(max_length) for _ in batch]
+            attention_mask = torch.stack(attention_mask)
         position_ids = [list(range(max_length)) for _ in batch]
         position_ids = torch.LongTensor(position_ids)
         input_ids = torch.LongTensor(
@@ -462,7 +482,6 @@ class GPTSFTDataset(Dataset):
         processed_batch = {
             'tokens': input_ids,
             'labels': labels,
-            'attention_mask': attention_mask,
             'loss_mask': loss_mask,
             'position_ids': position_ids,
             'contexts': contexts,
@@ -472,26 +491,55 @@ class GPTSFTDataset(Dataset):
             'token_count': token_count,
         }
 
+        if not self.get_attention_mask_from_fusion:
+            processed_batch['attention_mask'] = attention_mask
+
         return processed_batch
 
 
 class GPTSFTPackedDataset(GPTSFTDataset):
-    def __init__(self, file_path: str, tokenizer: TokenizerSpec, **kwargs):
+    def __init__(self, file_path: str, tokenizer: TokenizerSpec, return_cu_seqlen: bool = True, **kwargs):
+        np.random.seed(kwargs.get('seed', 1234))
         super().__init__(file_path, tokenizer, **kwargs)
+        assert self.virtual_tokens == 0, "P-Tuning with packed sequence is not supported."
 
-        self._load_packed_dataset(file_path)
+        # Whether to return `cu_seqlen` to pass to model. This should be true for almost all use cases.
+        self.return_cu_seqlen = return_cu_seqlen
 
     def __getitem__(self, idx):
+        if self.samples_mapping is not None:
+            # assert idx < len(self.samples_mapping)
+            idx = self.samples_mapping[idx]
+
         input_ids = self.indexed_dataset[idx]['input_ids']
         seq_boundaries = self.indexed_dataset[idx]['seq_start_id'] + [len(input_ids)]
         loss_mask = self.indexed_dataset[idx]['loss_mask']
+        if idx < 0:
+            loss_mask = [0] * len(loss_mask)
         return {'input_ids': input_ids, 'seq_boundaries': seq_boundaries, 'loss_mask': loss_mask}
 
-    def __len__(self):
-        return len(self.indexed_dataset)
+    def _load_dataset(self):
+        try:
+            self.indexed_dataset = np.load(self.file_path, allow_pickle=True)
+        except Exception as e:
+            logging.error(
+                f"Failed to load packed dataset. The dataset should be a `.npy` file. "
+                f"Please check if the packed dataset was prepared correctly. The original error was:\n {e}",
+            )
+            exit(1)
 
-    def _load_packed_dataset(self, file_path):
-        self.indexed_dataset = np.load(file_path, allow_pickle=True)
+    def _build_samples_mapping(self):
+        if self.max_num_samples is not None:
+            # custom samples mapping logic, following the format for unpacked sft dataset
+            # Note: this is epoch-level shuffling, i.e. sampling without replacement until end of epoch, then repeat.
+            # Unpacked dataset shuffles by sampling with replacement indefinitely.
+            dataset_len = len(self.indexed_dataset)
+            max_num_epochs = np.ceil(self.max_num_samples / dataset_len)
+            indices = np.arange(dataset_len)[None, :].repeat(max_num_epochs, axis=0)
+            [np.random.shuffle(x) for x in indices]
+            self.samples_mapping = indices.reshape(1, -1).squeeze()[: self.max_num_samples]
+        else:
+            self.samples_mapping = None
 
     def _build_loss_mask(self, processed_example):
         if self.answer_only_loss:
@@ -558,28 +606,42 @@ class GPTSFTPackedDataset(GPTSFTDataset):
             position_ids[0]
         ), "Dataset problem: input_ids and position_ids lengths don't match"
 
-        cu_seqlens = self._collate_item(cu_seqlens, max_length=max(len(l) for l in cu_seqlens) + 1, pad_id=-1)
         input_ids = self._collate_item(input_ids, max_length=max_length, pad_id=self.tokenizer.eos_id)
         labels = self._collate_item(labels, max_length=max_length, pad_id=self.tokenizer.eos_id)
         loss_mask = self._collate_item(loss_mask, max_length=max_length, pad_id=0)
         position_ids = self._collate_item(position_ids, max_length=max_length, pad_id=0)
 
-        # Pre-generate `cu_seqlens_argmin` and `max_seqlen` as CPU tensor to avoid device-to-host copies.
-        cu_seqlens = torch.IntTensor(cu_seqlens)
-        cu_seqlens_argmin = torch.argmin(cu_seqlens, dim=1, keepdim=True)
-        seqlens = cu_seqlens[:, 1:] - cu_seqlens[:, :-1]
-        max_seqlen, _ = seqlens.max(dim=1, keepdim=True)
-
         processed_batch = {
             'tokens': torch.LongTensor(input_ids),
             'labels': torch.LongTensor(labels),
-            'attention_mask': torch.LongTensor([1] * len(input_ids)),  # no attention mask is needed for packed seq
             'loss_mask': torch.LongTensor(loss_mask),
             'position_ids': torch.LongTensor(position_ids),
-            'cu_seqlens': torch.IntTensor(cu_seqlens),  # cu_seqlens_q must be in dtype torch.int32
             'token_count': token_count,
-            'cu_seqlens_argmin': cu_seqlens_argmin,
-            'max_seqlen': max_seqlen,
         }
+
+        if self.return_cu_seqlen:
+            cu_seqlens = self._collate_item(cu_seqlens, max_length=max(len(l) for l in cu_seqlens) + 1, pad_id=-1)
+
+            # Pre-generate `cu_seqlens_argmin` and `max_seqlen` as CPU tensor to avoid device-to-host copies.
+            cu_seqlens = torch.IntTensor(cu_seqlens)
+            cu_seqlens_argmin = torch.argmin(cu_seqlens, dim=1, keepdim=True)
+            seqlens = cu_seqlens[:, 1:] - cu_seqlens[:, :-1]
+            max_seqlen, _ = seqlens.max(dim=1, keepdim=True)
+
+            processed_batch.update(
+                {
+                    'attention_mask': torch.LongTensor(
+                        [1] * len(input_ids)
+                    ),  # no attention mask is needed for packed seq
+                    'cu_seqlens': torch.IntTensor(cu_seqlens),  # cu_seqlens_q must be in dtype torch.int32
+                    'cu_seqlens_argmin': cu_seqlens_argmin,  # only required for perf
+                    'max_seqlen': max_seqlen,  # only required for perf
+                }
+            )
+        else:
+            attention_mask = [self._create_attention_mask(max_length) for _ in batch]
+            processed_batch.update(
+                {'attention_mask': torch.stack(attention_mask),}
+            )
 
         return processed_batch

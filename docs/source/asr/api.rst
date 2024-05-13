@@ -1,4 +1,4 @@
-NeMo ASR collection API
+NeMo ASR Collection API
 =======================
 
 
@@ -41,7 +41,7 @@ Model Classes
 
 .. _confidence-ensembles-api:
 
-.. autoclass:: nemo.collections.asr.models.confidence_ensembles.ConfidenceEnsembleModel
+.. autoclass:: nemo.collections.asr.models.confidence_ensemble.ConfidenceEnsembleModel
     :show-inheritance:
     :members: transcribe
 
@@ -325,6 +325,4 @@ Adapter Strategies
     :members:
     :member-order: bysource
     :undoc-members: adapter_module_names
-
------
 

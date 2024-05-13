@@ -13,8 +13,8 @@
 # limitations under the License.
 
 import sys
-
 from typing import Union
+
 from omegaconf import DictConfig
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelSummary
@@ -22,6 +22,7 @@ from pytorch_lightning.plugins.environments import TorchElasticEnvironment
 
 from nemo.collections.nlp.parts.nlp_overrides import (
     CustomProgressBar,
+    FSDPMixedPrecisionPlugin,
     GradScaler,
     MegatronHalfPrecisionPlugin,
     NLPDDPStrategy,
@@ -30,6 +31,7 @@ from nemo.collections.nlp.parts.nlp_overrides import (
     PipelineMixedPrecisionPlugin,
 )
 from nemo.utils import logging
+from nemo.utils.callbacks.dist_ckpt_io import DistributedCheckpointIO
 
 
 class MegatronTrainerBuilder:
@@ -54,6 +56,7 @@ class MegatronTrainerBuilder:
         if self.cfg.model.get('fsdp', False):
             assert (
                 not self.cfg.model.optim.get('name') == 'distributed_fused_adam'
+                and not self.cfg.model.optim.get('name') == 'mcore_distributed_optim'
             ), 'Distributed optimizer cannot be used with FSDP.'
             sharded_checkpoint = self.cfg.model.get('fsdp_sharded_checkpoint', False)
             if self.cfg.model.get('tensor_model_parallel_size', 1) > 1:
@@ -70,6 +73,7 @@ class MegatronTrainerBuilder:
                 precision=self.cfg.trainer.precision,
                 nccl_communicator_config_path=self.cfg.model.get('nccl_communicator_config_path', None),
                 sharp=self.cfg.model.get('sharp', False),
+                use_orig_params=self.cfg.model.get('fsdp_use_orig_params', False),
             )
 
         return NLPDDPStrategy(
@@ -97,14 +101,20 @@ class MegatronTrainerBuilder:
         """
         megatron_amp_O2 = self.cfg.model.get('megatron_amp_O2', False)
         with_distributed_adam = (
-            self.cfg.model.optim.get('name') == 'distributed_fused_adam' if self.cfg.model.get('optim') else False
+            (
+                self.cfg.model.optim.get('name') == 'distributed_fused_adam'
+                or self.cfg.model.optim.get('name') == 'mcore_distributed_optim'
+            )
+            if self.cfg.model.get('optim')
+            else False
         )
 
         plugins = []
         if self.cfg.trainer.precision in [16, '16', 'bf16', '16-mixed', 'bf16-mixed']:
             scaler = None
             if self.cfg.trainer.precision in [16, '16', '16-mixed']:
-                scaler = self._grad_scaler()
+                if not self.cfg.model.get('fsdp', False):
+                    scaler = self._grad_scaler()
                 plugin_precision = '16-mixed'
             else:
                 plugin_precision = 'bf16-mixed'
@@ -112,19 +122,38 @@ class MegatronTrainerBuilder:
             if megatron_amp_O2 and not with_distributed_adam:
                 plugins.append(MegatronHalfPrecisionPlugin(precision=plugin_precision, device='cuda', scaler=scaler))
             else:
-                plugins.append(PipelineMixedPrecisionPlugin(precision=plugin_precision, device='cuda', scaler=scaler))
+                if self.cfg.model.get('fsdp', False):
+                    plugins.append(FSDPMixedPrecisionPlugin(precision=plugin_precision, scaler=scaler))
+                else:
+                    plugins.append(
+                        PipelineMixedPrecisionPlugin(precision=plugin_precision, device='cuda', scaler=scaler)
+                    )
+            self.cfg.trainer.precision = None
 
         if self.cfg.get('cluster_type', None) == 'BCP':
             plugins.append(TorchElasticEnvironment())
 
+        # Use dist-ckt for non-FSDP MCore models
+        use_dist_ckpt = not self.cfg.model.get('fsdp', False) and (
+            self.cfg.model.get('mcore_gpt', False) or self.cfg.model.get('mcore_bert', False)
+        )
+        if use_dist_ckpt:
+            plugins.append(DistributedCheckpointIO.from_config(self.cfg.model))
+
         return plugins
 
     def create_trainer(self, callbacks=None) -> Trainer:
+        # cfg.trainer.precision becomes None in Trainer if precision_plugins exist since both precision plugins and precision
+        precision = self.cfg.trainer.precision
         strategy = self._training_strategy()
         plugins = self._plugins()
-        if callbacks is None:
+        # enable_progress_bar is True by default. If cfg.trainer.enable_progress_bar=False, CustomProgressBar is not appended to callbacks
+        if 'enable_progress_bar' not in self.cfg.trainer or self.cfg.trainer.enable_progress_bar:
             callbacks = [CustomProgressBar()]
-        return Trainer(plugins=plugins, strategy=strategy, **self.cfg.trainer, callbacks=callbacks)
+        trainer = Trainer(plugins=plugins, strategy=strategy, **self.cfg.trainer, callbacks=callbacks)
+        # Restore the precision value after Trainer is built.
+        self.cfg.trainer.precision = precision
+        return trainer
 
 
 class MegatronBertTrainerBuilder(MegatronTrainerBuilder):
@@ -143,12 +172,34 @@ class MegatronT5TrainerBuilder(MegatronTrainerBuilder):
     def create_trainer(self) -> Trainer:
         strategy = self._training_strategy()
         plugins = self._plugins()
-        return Trainer(
-            plugins=plugins,
-            strategy=strategy,
-            **self.cfg.trainer,
-            callbacks=[ModelSummary(max_depth=3), CustomProgressBar()]
-        )
+        callbacks = [ModelSummary(max_depth=3)]
+        # enable_progress_bar is True by default. If cfg.trainer.enable_progress_bar=False, CustomProgressBar is not appended to callbacks
+        if 'enable_progress_bar' not in self.cfg.trainer or self.cfg.trainer.enable_progress_bar:
+            callbacks.append(CustomProgressBar())
+        return Trainer(plugins=plugins, strategy=strategy, **self.cfg.trainer, callbacks=callbacks)
+
+
+class MegatronStableDiffusionTrainerBuilder(MegatronTrainerBuilder):
+    """Builder for SD model Trainer with overrides."""
+
+    def _training_strategy(self) -> NLPDDPStrategy:
+        """
+        Returns a ddp strategy passed to Trainer.strategy.
+        """
+        ddp_overlap = self.cfg.model.get("ddp_overlap", True)
+        if ddp_overlap:
+            return NLPDDPStrategy(
+                no_ddp_communication_hook=False,
+                gradient_as_bucket_view=self.cfg.model.gradient_as_bucket_view,
+                find_unused_parameters=True,
+                bucket_cap_mb=256,
+            )
+        else:
+            return NLPDDPStrategy(
+                no_ddp_communication_hook=True,
+                gradient_as_bucket_view=self.cfg.model.gradient_as_bucket_view,
+                find_unused_parameters=False,
+            )
 
 
 class MegatronLMPPTrainerBuilder(MegatronTrainerBuilder):
